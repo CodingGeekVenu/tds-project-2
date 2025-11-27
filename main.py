@@ -2,7 +2,7 @@ import sys
 import asyncio
 
 # FORCE WINDOWS TO USE THE CORRECT LOOP FOR PLAYWRIGHT
-# This fixes the "NotImplementedError" on Windows machines
+# This fixes "NotImplementedError" on Windows
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
@@ -19,12 +19,12 @@ from openai import AsyncOpenAI
 from contextlib import asynccontextmanager
 
 # --- CONFIGURATION ---
-# Your specific AI Pipe Token
+# Your AI Pipe Token
 AI_PIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjMwMDE4MzhAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Z8q3Ks-1adsY9WSlg6rO1pnJOUTlItzGti69W-QETTI"
 AI_PIPE_BASE_URL = "https://aipipe.org/openrouter/v1"
 AI_PIPE_MODEL = "openai/gpt-4o-mini" 
 
-# Your Student Details
+# Student Details
 STUDENT_EMAIL = "23f3001838@ds.study.iitm.ac.in"
 STUDENT_SECRET = "TDS_2025_GenAI"
 
@@ -60,7 +60,8 @@ class QuizRequest(BaseModel):
     secret: str
     url: str
 
-# --- HELPER: FILE DOWNLOADER & PARSER ---
+# --- TOOLS: FETCHERS & PARSERS ---
+
 async def download_and_parse_file(file_url: str):
     """
     Downloads a file (CSV/JSON/PDF) and returns its text content.
@@ -78,7 +79,7 @@ async def download_and_parse_file(file_url: str):
         
         if ".csv" in filename:
             df = pd.read_csv(io.BytesIO(content_bytes))
-            content_str = df.to_csv(index=False) # Convert back to string for LLM
+            content_str = df.to_csv(index=False)
         elif ".xlsx" in filename:
             df = pd.read_excel(io.BytesIO(content_bytes))
             content_str = df.to_csv(index=False)
@@ -89,140 +90,130 @@ async def download_and_parse_file(file_url: str):
                 text.append(page.extract_text())
             content_str = "\n".join(text)
         else:
-            # Try decoding as plain text
+            # Try decoding as plain text (JSON, TXT, HTML)
             content_str = content_bytes.decode("utf-8", errors="ignore")
             
-        # Limit content size for LLM (GPT-4o-mini limit)
-        return content_str[:20000] 
+        return content_str[:20000] # Limit size
         
     except Exception as e:
         print(f"File processing failed: {e}")
         return f"Error reading file: {str(e)}"
 
-# --- MAIN ENDPOINT ---
-@app.post("/run")
-async def solve_quiz(request: QuizRequest):
-    print(f"\n=== NEW TASK: {request.url} ===")
+async def fetch_page_content(url: str):
+    """
+    Smart fetcher: Handles HTML pages (via Playwright) AND direct files/APIs (via HTTPX).
+    """
+    print(f"Fetching content from: {url}")
     
-    # Security Check
-    if request.secret != STUDENT_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid Secret")
+    # 1. Try direct HTTP get first (faster for APIs/Files)
+    try:
+        # Check if it looks like a file or API
+        if any(ext in url.lower() for ext in ['.csv', '.pdf', '.json', '.xlsx', '/api/']):
+            return await download_and_parse_file(url)
+    except:
+        pass 
 
-    # 1. Scrape the Main Page
-    scraped_text = ""
+    # 2. Fallback to Playwright (for JS-heavy HTML)
     try:
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             page = await context.new_page()
             
-            # Go to the page
-            await page.goto(request.url, timeout=30000)
+            await page.goto(url, timeout=30000)
             
-            # --- CRITICAL FIX FOR DYNAMIC CONTENT & HIDDEN ELEMENTS ---
-            # 1. Wait 2 seconds for any JavaScript animations/loading to finish
-            await page.wait_for_timeout(2000)
+            # CRITICAL: Wait for JS to load content (Fixes Vercel/SPA issues)
+            await page.wait_for_timeout(2000) 
             await page.wait_for_load_state("networkidle")
             
-            # 2. Use innerHTML (not innerText) so the LLM can see hidden divs,
-            # inputs, and raw structure (needed for the Password task).
-            scraped_text = await page.evaluate("document.body.innerHTML")
-            
-            # Also get all links (hrefs) in case the LLM needs to find a file link
-            links = await page.evaluate("""
-                Array.from(document.querySelectorAll('a')).map(a => ({text: a.innerText, href: a.href}))
-            """)
-            
+            # CRITICAL: Use innerHTML to see hidden elements (Fixes Hidden Password task)
+            content = await page.evaluate("document.body.innerHTML") 
             await browser.close()
+            return content
     except Exception as e:
-        print(f"Scraping Failed: {e}")
-        raise HTTPException(status_code=500, detail="Scraping failed")
+        return f"Error fetching {url}: {e}"
 
-    # 2. Phase 1: Analyze & Plan
-    print("Phase 1 Analysis: Checking for files...")
-    links_json = json.dumps(links[:20]) # Limit to first 20 links to save tokens
+# --- MAIN SOLVER ---
+@app.post("/run")
+async def solve_quiz(request: QuizRequest):
+    print(f"\n=== NEW TASK: {request.url} ===")
     
-    # We tell the LLM to look at the HTML structure
-    prompt_phase1 = f"""
-    You are a data analysis agent.
-    
-    PAGE HTML CONTENT:
-    {scraped_text[:15000]} 
-    
-    LINKS ON PAGE:
-    {links_json}
-    
-    TASK:
-    1. Read the content. Look for questions, hidden keys, or data tasks.
-    2. Does the question require downloading a file (CSV, PDF, etc)?
-    3. If YES, return the 'file_url'. If NO, return null.
-    4. Extract the 'submit_url' (look for form actions or text saying "submit to").
-    
-    OUTPUT JSON ONLY:
-    {{
-        "requires_file": true/false,
-        "file_url": "https://...",
-        "submit_url": "https://..."
-    }}
-    """
-    
-    try:
-        resp1 = await client.chat.completions.create(
-            model=AI_PIPE_MODEL,
-            messages=[{"role": "user", "content": prompt_phase1}],
-            response_format={"type": "json_object"}
-        )
-        plan = json.loads(resp1.choices[0].message.content)
-        print(f"Plan: {plan}")
-    except Exception as e:
-        return {"error": "Planning failed", "details": str(e)}
+    if request.secret != STUDENT_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid Secret")
 
-    # 3. Execute File Download (If needed)
-    additional_context = ""
-    if plan.get("requires_file") and plan.get("file_url"):
-        file_url = plan["file_url"]
-        # Handle relative URLs if necessary (assuming absolute for now or LLM fixes it)
-        file_content = await download_and_parse_file(file_url)
-        additional_context = f"\n\n--- DOWNLOADED FILE CONTENT ---\n{file_content}\n--- END FILE ---\n"
+    # "Conversation History" to keep track of what we've seen
+    data_context = f"Initial Request URL: {request.url}\n"
+    
+    # Initial Fetch
+    initial_content = await fetch_page_content(request.url)
+    data_context += f"\n--- CONTENT OF {request.url} ---\n{initial_content[:15000]}\n"
 
-    # 4. Phase 2: Final Solve
-    print("Phase 2: Solving...")
-    final_prompt = f"""
-    You are a quiz solver.
+    # THE LOOP: Iterate up to 5 times to handle pagination or multi-step logic
+    answer = None
+    submit_url = None
     
-    ORIGINAL PAGE HTML:
-    {scraped_text[:15000]}
-    
-    {additional_context}
-    
-    TASK:
-    1. Solve the question found in the HTML. 
-    2. If there is a hidden key or reversed text, decode it.
-    3. If you have file content, use it to calculate the answer.
-    4. Return the answer in JSON format.
-    
-    OUTPUT JSON ONLY:
-    {{
-        "answer": <value>
-    }}
-    """
-    
-    try:
-        resp2 = await client.chat.completions.create(
-            model=AI_PIPE_MODEL,
-            messages=[{"role": "user", "content": final_prompt}],
-            response_format={"type": "json_object"}
-        )
-        final_result = json.loads(resp2.choices[0].message.content)
-        answer = final_result.get("answer")
-        print(f"Calculated Answer: {answer}")
-    except Exception as e:
-        return {"error": "Solving failed", "details": str(e)}
+    for step in range(5):
+        print(f"Step {step + 1}: Analyzing & Reasoning...")
+        
+        prompt = f"""
+        You are an autonomous agent solving a quiz.
+        
+        CURRENT DATA CONTEXT:
+        {data_context}
+        
+        YOUR GOAL:
+        1. Read the content. Understand the Question.
+        2. If the answer is NOT in the current data, determine which URL to fetch next (e.g., next page in pagination, or a file link).
+        3. Look for the 'submit_url' in the text/code.
+        4. If you found the answer, output it.
+        
+        OUTPUT JSON ONLY:
+        {{
+            "reasoning": "Explanation of what to do next...",
+            "fetch_new_url": "https://... (only if you need more data, else null)",
+            "answer": "The final answer (or null if fetching more data)",
+            "submit_url": "https://... (extracted from text, keep previous if not found)"
+        }}
+        """
+        
+        try:
+            response = await client.chat.completions.create(
+                model=AI_PIPE_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"}
+            )
+            decision = json.loads(response.choices[0].message.content)
+            print(f"AI Decision: {decision.get('reasoning')}")
+            
+            # Update submit_url if found
+            if decision.get("submit_url"):
+                submit_url = decision["submit_url"]
 
-    # 5. Submit the Answer
-    submit_url = plan.get("submit_url")
+            # CHECK: Do we have the answer?
+            if decision.get("answer") is not None:
+                answer = decision["answer"]
+                break # EXIT LOOP -> We are done!
+            
+            # CHECK: Do we need to fetch more?
+            new_url = decision.get("fetch_new_url")
+            if new_url:
+                print(f"Agent requested new URL: {new_url}")
+                new_content = await fetch_page_content(new_url)
+                # Append new data to context so LLM sees everything
+                data_context += f"\n--- CONTENT OF {new_url} ---\n{new_content[:10000]}\n"
+            else:
+                print("AI is stuck (no answer, no new URL). Stopping.")
+                break
+                
+        except Exception as e:
+            print(f"Loop Error: {e}")
+            break
+
+    # Final Submission
     if not submit_url:
-        return {"error": "No submission URL found"}
+        # Fallback logic: sometimes LLM misses it, maybe it was in the first prompt? 
+        # For now, we return error if missing.
+        return {"status": "error", "message": "No submission URL found."}
 
     payload = {
         "email": STUDENT_EMAIL,
@@ -231,12 +222,12 @@ async def solve_quiz(request: QuizRequest):
         "answer": answer
     }
     
-    print(f"Submitting to {submit_url}...")
+    print(f"Submitting answer: {answer} to {submit_url}")
     try:
         async with httpx.AsyncClient() as post_client:
             sub_resp = await post_client.post(submit_url, json=payload, timeout=10)
             
-            # Return the specific format the server expects (or just a success message)
+            # Return strict format expected by the server
             return {
                 "status": "success", 
                 "submitted_to": submit_url,
