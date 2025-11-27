@@ -2,12 +2,12 @@ import sys
 import asyncio
 
 # FORCE WINDOWS TO USE THE CORRECT LOOP FOR PLAYWRIGHT
+# This fixes the "NotImplementedError" on Windows machines
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import os
 import json
-import asyncio
 import httpx
 import pandas as pd
 import io
@@ -19,32 +19,39 @@ from openai import AsyncOpenAI
 from contextlib import asynccontextmanager
 
 # --- CONFIGURATION ---
-AI_PIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjMwMDE4MzhAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Z8q3Ks-1adsY9WSlg6rO1pnJOUTlItzGti69W-QETTI" # <--- PASTE YOUR TOKEN HERE AGAIN
+# Your specific AI Pipe Token
+AI_PIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjMwMDE4MzhAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Z8q3Ks-1adsY9WSlg6rO1pnJOUTlItzGti69W-QETTI"
 AI_PIPE_BASE_URL = "https://aipipe.org/openrouter/v1"
 AI_PIPE_MODEL = "openai/gpt-4o-mini" 
 
+# Your Student Details
 STUDENT_EMAIL = "23f3001838@ds.study.iitm.ac.in"
 STUDENT_SECRET = "TDS_2025_GenAI"
 
 # Initialize AI Client
 client = AsyncOpenAI(api_key=AI_PIPE_TOKEN, base_url=AI_PIPE_BASE_URL)
 
-# --- KEEP ALIVE (Render) ---
+# --- KEEP ALIVE (For Render Free Tier) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup: Launch the background pinger
     task = asyncio.create_task(keep_alive_loop())
     yield
+    # Shutdown
     task.cancel()
 
 async def keep_alive_loop():
+    """Pings the server itself every 10 minutes to prevent sleep."""
     while True:
         try:
+            # Use the Render URL if deployed, else localhost
             my_url = os.getenv("RENDER_EXTERNAL_URL", "http://localhost:8000")
-            if "localhost" not in my_url: # Only ping if deployed
+            if "localhost" not in my_url: 
                 async with httpx.AsyncClient() as c:
                     await c.get(my_url)
-        except: pass
-        await asyncio.sleep(600)
+        except: 
+            pass
+        await asyncio.sleep(600) # Sleep 10 minutes
 
 app = FastAPI(lifespan=lifespan)
 
@@ -97,6 +104,7 @@ async def download_and_parse_file(file_url: str):
 async def solve_quiz(request: QuizRequest):
     print(f"\n=== NEW TASK: {request.url} ===")
     
+    # Security Check
     if request.secret != STUDENT_SECRET:
         raise HTTPException(status_code=403, detail="Invalid Secret")
 
@@ -107,11 +115,18 @@ async def solve_quiz(request: QuizRequest):
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             page = await context.new_page()
+            
+            # Go to the page
             await page.goto(request.url, timeout=30000)
+            
+            # --- CRITICAL FIX FOR DYNAMIC CONTENT & HIDDEN ELEMENTS ---
+            # 1. Wait 2 seconds for any JavaScript animations/loading to finish
+            await page.wait_for_timeout(2000)
             await page.wait_for_load_state("networkidle")
             
-            # Get all text
-            scraped_text = await page.evaluate("document.body.innerText")
+            # 2. Use innerHTML (not innerText) so the LLM can see hidden divs,
+            # inputs, and raw structure (needed for the Password task).
+            scraped_text = await page.evaluate("document.body.innerHTML")
             
             # Also get all links (hrefs) in case the LLM needs to find a file link
             links = await page.evaluate("""
@@ -123,24 +138,25 @@ async def solve_quiz(request: QuizRequest):
         print(f"Scraping Failed: {e}")
         raise HTTPException(status_code=500, detail="Scraping failed")
 
-    # 2. Analyze: Do we need to download anything?
+    # 2. Phase 1: Analyze & Plan
     print("Phase 1 Analysis: Checking for files...")
     links_json = json.dumps(links[:20]) # Limit to first 20 links to save tokens
     
+    # We tell the LLM to look at the HTML structure
     prompt_phase1 = f"""
     You are a data analysis agent.
     
-    PAGE TEXT:
-    {scraped_text[:5000]}
+    PAGE HTML CONTENT:
+    {scraped_text[:15000]} 
     
     LINKS ON PAGE:
     {links_json}
     
     TASK:
-    1. Read the question.
+    1. Read the content. Look for questions, hidden keys, or data tasks.
     2. Does the question require downloading a file (CSV, PDF, etc)?
     3. If YES, return the 'file_url'. If NO, return null.
-    4. Also extract the 'submit_url'.
+    4. Extract the 'submit_url' (look for form actions or text saying "submit to").
     
     OUTPUT JSON ONLY:
     {{
@@ -169,20 +185,21 @@ async def solve_quiz(request: QuizRequest):
         file_content = await download_and_parse_file(file_url)
         additional_context = f"\n\n--- DOWNLOADED FILE CONTENT ---\n{file_content}\n--- END FILE ---\n"
 
-    # 4. Final Solve
+    # 4. Phase 2: Final Solve
     print("Phase 2: Solving...")
     final_prompt = f"""
     You are a quiz solver.
     
-    ORIGINAL PAGE TEXT:
-    {scraped_text[:5000]}
+    ORIGINAL PAGE HTML:
+    {scraped_text[:15000]}
     
     {additional_context}
     
     TASK:
-    1. Solve the question found in the page text. 
-    2. If you have file content, use it to calculate the answer (e.g. sum columns).
-    3. Return the answer in JSON.
+    1. Solve the question found in the HTML. 
+    2. If there is a hidden key or reversed text, decode it.
+    3. If you have file content, use it to calculate the answer.
+    4. Return the answer in JSON format.
     
     OUTPUT JSON ONLY:
     {{
@@ -202,7 +219,7 @@ async def solve_quiz(request: QuizRequest):
     except Exception as e:
         return {"error": "Solving failed", "details": str(e)}
 
-    # 5. Submit
+    # 5. Submit the Answer
     submit_url = plan.get("submit_url")
     if not submit_url:
         return {"error": "No submission URL found"}
@@ -218,6 +235,8 @@ async def solve_quiz(request: QuizRequest):
     try:
         async with httpx.AsyncClient() as post_client:
             sub_resp = await post_client.post(submit_url, json=payload, timeout=10)
+            
+            # Return the specific format the server expects (or just a success message)
             return {
                 "status": "success", 
                 "submitted_to": submit_url,
