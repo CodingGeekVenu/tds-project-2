@@ -133,7 +133,7 @@ async def solve_quiz(request: QuizRequest):
     for step in range(15):
         print(f"🧠 Step {step + 1}: Analyzing...")
         
-        # --- KEY UPDATE: Added Instruction for 'project2' start page ---
+        # --- KEY UPDATE: Added Logic for Submit URL ---
         prompt = f"""
         You are an autonomous data agent.
         
@@ -151,6 +151,8 @@ async def solve_quiz(request: QuizRequest):
         4. If you found the answer, output it.
         
         IMPORTANT:
+        - The 'submit_url' is almost ALWAYS "https://tds-llm-analysis.s-anand.net/submit". Use this unless the page explicitly gives a different FULL URL for submission.
+        - The text "url = ..." usually refers to the JSON payload, NOT the submission endpoint.
         - If the page mentions "project2" or "How to play" and asks you to start, the answer is usually an empty JSON object: {{}}
         - If the answer is found, set it in the "answer" field. Do NOT return null for answer if you are ready to submit.
         
@@ -208,9 +210,10 @@ async def solve_quiz(request: QuizRequest):
             print(f"❌ Loop Error: {e}")
             break
 
+    # --- FALLBACK: Force correct submit URL if missing or wrong ---
     if not submit_url:
-        return {"status": "error", "message": "No submission URL found."}
-
+        submit_url = "https://tds-llm-analysis.s-anand.net/submit"
+    
     # Fallback to empty JSON if answer is still None
     if answer is None:
         answer = "{}"
