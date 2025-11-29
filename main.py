@@ -17,13 +17,13 @@ from playwright.async_api import async_playwright
 from openai import AsyncOpenAI
 from contextlib import asynccontextmanager
 
-# --- CONFIGURATION ---
-# Your AI Pipe Token
-AI_PIPE_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJlbWFpbCI6IjIzZjMwMDE4MzhAZHMuc3R1ZHkuaWl0bS5hYy5pbiJ9.Z8q3Ks-1adsY9WSlg6rO1pnJOUTlItzGti69W-QETTI"
-AI_PIPE_BASE_URL = "https://aipipe.org/openrouter/v1"
-AI_PIPE_MODEL = "openai/gpt-4o-mini" 
+# --- CONFIGURATION (SECURE) ---
+# We now read these from Render's Environment Variables
+AI_PIPE_TOKEN = os.getenv("AI_PIPE_TOKEN", "") # Defaults to empty if not set
+AI_PIPE_BASE_URL = os.getenv("AI_PIPE_BASE_URL", "https://aipipe.org/openrouter/v1")
+AI_PIPE_MODEL = os.getenv("AI_PIPE_MODEL", "openai/gpt-4o-mini") 
 
-# Your Student Details
+# Student Details
 STUDENT_EMAIL = "23f3001838@ds.study.iitm.ac.in"
 STUDENT_SECRET = "TDS_2025_GenAI"
 
@@ -247,8 +247,6 @@ async def solve_quiz(request: QuizRequest):
     try:
         async with httpx.AsyncClient() as post_client:
             sub_resp = await post_client.post(submit_url, json=payload, timeout=15)
-            
-            # Return strict format expected by the server
             return {
                 "status": "success", 
                 "submitted_to": submit_url,
