@@ -133,7 +133,7 @@ async def solve_quiz(request: QuizRequest):
     for step in range(15):
         print(f"🧠 Step {step + 1}: Analyzing...")
         
-        # --- UPDATE: WE NOW GIVE CREDENTIALS TO THE LLM ---
+        # --- KEY UPDATE: Added Instruction for 'project2' start page ---
         prompt = f"""
         You are an autonomous data agent.
         
@@ -150,6 +150,10 @@ async def solve_quiz(request: QuizRequest):
         3. Identify the 'submit_url'.
         4. If you found the answer, output it.
         
+        IMPORTANT:
+        - If the page mentions "project2" or "How to play" and asks you to start, the answer is usually an empty JSON object: {{}}
+        - If the answer is found, set it in the "answer" field. Do NOT return null for answer if you are ready to submit.
+        
         OUTPUT JSON ONLY:
         {{
             "reasoning": "Explanation...",
@@ -160,7 +164,7 @@ async def solve_quiz(request: QuizRequest):
                 "headers": {{ "Key": "Value" }}, 
                 "data": {{ "key": "value" }}
             }} (OR null),
-            "answer": "Final answer string/number" (OR null if not ready),
+            "answer": "Final answer string/number/json_string" (OR null if not ready),
             "submit_url": "https://..." 
         }}
         """
@@ -177,6 +181,7 @@ async def solve_quiz(request: QuizRequest):
             if decision.get("submit_url"):
                 submit_url = decision["submit_url"]
 
+            # Capture answer if provided
             if decision.get("answer") is not None:
                 answer = decision["answer"]
                 break 
@@ -190,6 +195,12 @@ async def solve_quiz(request: QuizRequest):
                 new_content = await smart_fetch(tool['url'], method, headers, data)
                 data_context += f"\n--- RESULT FROM {tool['url']} ---\n{new_content[:10000]}\n"
             else:
+                # If AI decides to submit but returned 'answer: null' (common error), we fallback to "{}"
+                if submit_url and answer is None:
+                    print("⚠️ AI ready to submit but gave no answer. Defaulting to '{}' for start page.")
+                    answer = "{}"
+                    break
+                
                 print("⚠️ AI stuck.")
                 break
                 
@@ -199,6 +210,10 @@ async def solve_quiz(request: QuizRequest):
 
     if not submit_url:
         return {"status": "error", "message": "No submission URL found."}
+
+    # Fallback to empty JSON if answer is still None
+    if answer is None:
+        answer = "{}"
 
     payload = {
         "email": STUDENT_EMAIL,
